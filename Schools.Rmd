@@ -1,0 +1,451 @@
+---
+title: "LondonSchools"
+author: "Adam Dennett"
+date: "30/04/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Loading packages
+library(sf)
+library(tidyverse)
+library(here)
+library(stringr)
+library(ggplot2)
+library(tmap)
+library(sf)
+library(geojson)
+library(ggspatial)
+library(geojsonio)
+library(tmaptools)
+library(viridis)
+library(janitor)
+library(cowplot)
+library(stplanr)
+library(osrm)
+library(knitr)
+library(usethis)
+library(readxl)
+library(httr)
+library(broom)
+```
+
+### With many thanks to Signe Swarttouw - https://github.com/signesw/GIS_Coursework - from whom I have borrowed some of this code
+
+```{r cars}
+#Reading in all schools basefile, and filtering out for the ones that are open, and in London
+LondonSchools <- read_csv("https://www.dropbox.com/s/pk56hu33liaog46/edubasealldata.csv?raw=1") %>% 
+  dplyr::filter(str_detect(`EstablishmentStatus (name)`, "Open")) %>%  
+  dplyr::filter(str_detect(`DistrictAdministrative (code)`, "^E09")) %>% 
+  clean_names()
+
+#Create a simplefeatures object out of the LondonSchools
+
+LondonSchools_sf <- LondonSchools %>% 
+  st_as_sf(., coords = c("easting", "northing")) %>% 
+  st_set_crs(27700)
+```
+
+```{r}
+#Read an LSOA shapefile
+
+use_zip("https://data.london.gov.uk/download/statistical-gis-boundary-files-london/9ba8c833-6370-4b11-abdc-314aa020d5e0/statistical-gis-boundaries-london.zip", destdir = getwd())
+unzip("statistical-gis-boundaries-london.zip", exdir = getwd())
+
+London_LSOAs <- st_read("statistical-gis-boundaries-london/ESRI/LSOA_2011_London_gen_MHW.shp")%>% st_transform(27700) %>% clean_names
+
+London_Boroughs <- st_read("statistical-gis-boundaries-london/ESRI/London_Borough_Excluding_MHW.shp") %>% st_transform(27700) %>% clean_names
+
+
+#Let's plot our Study Area
+study_area <- ggplot()+ geom_sf(data=London_LSOAs, color="#696868",size=0.1,linetype = "solid", fill='#ede9e8')+
+          geom_sf(data=London_Boroughs,color="black",size=0.3,linetype = "solid", fill=NA)+
+          theme_map()+
+          annotation_scale(location = "bl")+
+          annotation_north_arrow(location = "tl", which_north = "true",
+                         height = unit(1, "cm"),
+                         width = unit(1, "cm"),
+                         pad_y = unit(0.1, "in"),
+                         style = north_arrow_fancy_orienteering)
+
+study_area
+```
+
+## School Flow Data
+
+```{r}
+#Remove points outside of London
+LondonSchools_sf <- LondonSchools_sf[London_LSOAs,]
+
+#need to predownload some school flow data in .xlsx format from here:
+#https://data.london.gov.uk/dataset/london-schools-atlas
+
+Catchments_LSOAtoSecSchool_2016 <- read_excel("Catchments_LSOAtoSecSchool_2016_LDS.xlsx", sheet = "LSOAtoSecSchool_LDS_2016") %>% clean_names()
+Catchments_SecSchootoLSOA_2016 <- read_excel("Catchments_SecSchootoLSOA_2016_LDS.xlsx", sheet = "SecSchootoLSOA_LDS_2016") %>% clean_names()
+
+```
+
+
+```{r}
+#Getting unique URN values for the schools with flows
+CatchmentDistinct <- unique(Catchments_SecSchootoLSOA_2016$secondary_school_urn)
+#Now filter out the schools with flows to get our final schools
+FinalSchools <- filter(LondonSchools_sf, urn %in% CatchmentDistinct)
+#now fix the table for later versions of R and tmap
+#FinalSchools <- st_as_sf(as.data.frame(FinalSchools))
+
+#Get unique schools
+URNs <- unique(FinalSchools$urn)
+
+#Filter out LSOAs that are not within London
+LSOAs <- unique(London_LSOAs$lsoa11cd)
+FinalCatchment <- subset(Catchments_SecSchootoLSOA_2016, secondary_school_urn %in% URNs) %>%  subset(., lsoa_code %in% LSOAs)
+
+#Cleaning the data (remove unecessary columns):
+FinalCatchment <- dplyr::select(FinalCatchment, -c(secondary2lsoa_flow_no)) %>% 
+  rename(urn="secondary_school_urn")
+
+FinalCatchment <- FinalCatchment %>% unite("od_code", c("lsoa_code", "urn"), sep = "_", remove = F)
+
+#Merge geometry column from schools to flow dataframe -
+CatchmentWithGeometry <- dplyr::left_join(FinalSchools,FinalCatchment,by="urn")
+
+```
+
+```{r}
+names(CatchmentWithGeometry)
+```
+
+
+## Origin / Destination Flows
+
+```{r}
+#Simplify table
+FlowsWithGeometry <- dplyr::select(CatchmentWithGeometry, c(secondary_school_name,lsoa_code.y, pupil_count,geometry))
+
+#Rename column in London_LSOAs
+London_LSOAs <- London_LSOAs %>% rename(lsoa_code="lsoa11cd")
+
+#take centroid of LSOA areas
+Points_LSOA <- st_centroid(London_LSOAs)
+
+#lets just look at LSOA Code and geometry
+Points_LSOA <- dplyr::select(Points_LSOA, c(lsoa_code,geometry)) %>% 
+  rename(name="lsoa_code")
+
+#get a df with just school name and geometry
+Points_Schools <- dplyr::select(FlowsWithGeometry, c(secondary_school_name,geometry)) %>% 
+  rename(name="secondary_school_name")
+
+#join points and secondary school names
+zones=rbind(Points_Schools,Points_LSOA)
+
+#Get the travel lines
+travel_lines <- od2line(flow = FlowsWithGeometry, zones = zones)
+```
+
+
+## Create a big OD matrix
+
+```{r}
+#create a big LSOA to school matrix
+
+lsoa_to_school_matrix <- matrix(0, nrow = nrow(London_LSOAs), ncol = nrow(FinalSchools),
+                                dimnames = list(London_LSOAs$lsoa_code,FinalSchools$urn))
+
+lsoa_to_school_all <- odmatrix_to_od(lsoa_to_school_matrix)
+
+#add the lsoa names
+lsoa_to_school_all$orig_name <- London_LSOAs$lsoa11nm[match(lsoa_to_school_all$orig, London_LSOAs$lsoa_code)]
+
+#add the school names
+lsoa_to_school_all$dest_name <- FinalSchools$establishment_name[match(lsoa_to_school_all$dest, FinalSchools$urn)]
+
+lsoa_to_school_all <- lsoa_to_school_all %>% unite("od_code", c("orig", "dest"), sep = "_", remove = F)
+
+lsoa_to_school_all$flow <- FinalCatchment$pupil_count[match(lsoa_to_school_all$od_code, FinalCatchment$od_code)]
+  
+#cdata$OrigCodeNew <- CodeLookup$NewCode[match(cdata$OrigCode, CodeLookup$OldCode)]
+
+```
+
+```{r}
+tmap_mode("view")
+plt <- tm_shape(travel_lines) +
+  tm_lines(palette = "plasma", breaks = c(0, 5, 10, 20, 40, 100,200),
+           lwd = "pupil_count",
+           scale = 9,
+           id="lsoa_code.y",
+           popup.vars= c("lsoa_code.y", "secondary_school_name","pupil_count"),
+           title.lwd = "number_of_pupils",
+           alpha = 0.6,
+           col = "pupil_count",
+           title = "Pupil Count")+
+  tm_shape(st_geometry(FinalSchools))+
+          tm_dots(col="black", size=0.01,id="establishment_name")
+
+plt
+```
+
+## Distance to Schools
+
+```{r}
+#add URNs
+CatchmentNoGeometry <- st_set_geometry(CatchmentWithGeometry, NULL)
+
+#Straight line distances
+l_distances <- geo_length(travel_lines)
+# Convert to km
+travel_lines$distances <- l_distances/1000
+
+#add column for average distance traveled, grouped by LSOA
+travel_lines$total_distance <- ((travel_lines$pupil_count)*(travel_lines$distances))
+#Make new df grouped by LSOA
+Sums_LSOA <- st_set_geometry(travel_lines,NULL) %>% 
+  dplyr::select(., c(lsoa_code.y,pupil_count,total_distance)) %>% group_by(lsoa_code.y) %>% summarize_all(sum)
+Sums_LSOA <- transform(Sums_LSOA, average_distance = (total_distance / pupil_count))
+```
+
+
+## LSOA Characteristics
+
+```{r}
+#read an excel file from the web - curl is the key here. 
+download.file("https://londondatastore-upload.s3.amazonaws.com/lsoa-data.xls", destfile = "LSOA_Atlas.xls", method = "curl")
+
+#have a look inside the horrible file and read in just the bits you want
+atlas_headers <- as.list(read_xls("LSOA_Atlas.xls", sheet = 2, range = "A2:BG2") %>% clean_names())
+names(atlas_headers)
+
+LSOA_Atlas <- read_xls("LSOA_Atlas.xls", sheet = 2, range = "A4:BG4838", col_names = c(
+  "lsoa_code",                                                                     
+  "lsoa_name",                                                                       
+  "no_adults_in_employment_in_household_with_dependent_children",              
+  "percent_of_households_with_no_adults_in_employment_with_dependent_children",
+  "all_lone_parent_housholds_with_dependent_children",                         
+  "lone_parents_not_in_employment",                                            
+  "lone_parent_not_in_employment_percent",                                     
+  "economically_active_total",                                                 
+  "economically_inactive_total" ,                                              
+  "economically_active_employee",                                             
+  "economically_active_self_employed",                                         
+  "economically_active_unemployed",                                            
+  "economically_active_full_time_student",                                     
+  "employment_rate",                                                           
+  "unemployment_rate",                                                         
+  "no_qualifications",                                                         
+  "highest_level_of_qualification_level_1_qualifications",
+  "highest_level_of_qualification_level_2_qualifications",                     
+  "highest_level_of_qualification_apprenticeship",                             
+  "highest_level_of_qualification_level_3_qualifications",                     
+  "highest_level_of_qualification_level_4_qualifications_and_above",           
+  "highest_level_of_qualification_other_qualifications",                       
+  "schoolchildren_and_full_time_students_age_18_and_over",                     
+  "percent_no_qualifications",                                                 
+  "percent_highest_level_of_qualification_level_1_qualifications",             
+  "percent_highest_level_of_qualification_level_2_qualifications",            
+  "percent_highest_level_of_qualification_apprenticeship",                     
+  "percent_highest_level_of_qualification_level_3_qualifications",             
+  "percent_highest_level_of_qualification_level_4_qualifications_and_above",   
+  "percent_highest_level_of_qualification_other_qualifications",               
+  "percent_schoolchildren_and_full_time_students_age_18_and_over",             
+  "day_to_day_activities_limited_a_lot",                                       
+  "day_to_day_activities_limited_a_little",                                    
+  "day_to_day_activities_not_limited",                                         
+  "very_good_or_good_health",                                                  
+  "fair_health",                                                               
+  "bad_or_very_bad_health",                                                    
+  "day_to_day_activities_limited_a_lot_percent",                               
+  "day_to_day_activities_limited_a_little_percent",                            
+  "day_to_day_activities_not_limited_percent",                                 
+  "very_good_or_good_health_percent",                                          
+  "fair_health_percent",                                                       
+  "bad_or_very_bad_health_percent",                                            
+  "no_cars_or_vans_in_household",                                              
+  "x1_car_or_van_in_household",                                                
+  "x2_cars_or_vans_in_household",                                              
+  "x3_cars_or_vans_in_household",                                              
+  "x4_or_more_cars_or_vans_in_household",                                      
+  "sum_of_all_cars_or_vans_in_the_area",                                       
+  "no_cars_or_vans_in_household_percent",                                      
+  "x1_car_or_van_in_household_percent",                                        
+  "x2_cars_or_vans_in_household_percent",                                      
+  "x3_cars_or_vans_in_household_percent",                                      
+  "x4_or_more_cars_or_vans_in_household_percent",                              
+  "cars_per_household",                                                        
+  "total_number_of_children",                                                  
+  "total_number_of_families_claiming_benefit",                                 
+  "number_of_families_with_3_children",                                        
+  "percent_of_families_with_3_children"
+), col_types = c(
+  "text",
+  "text",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric",
+  "numeric"
+), na = "-")
+
+
+
+```
+
+## School Demand Modelling
+
+```{r}
+lsoa_to_school_obvs <- travel_lines
+lsoa_to_school_obvs$dest <- lsoa_to_school_all$dest[match(lsoa_to_school_obvs$secondary_school_name,lsoa_to_school_all$dest_name)]
+
+lsoa_to_school_obvs <- lsoa_to_school_obvs %>% unite("od_code", c("lsoa_code.y", "dest"), sep = "_", remove = F)
+
+lsoa_to_school_obvs$orig_lsoa_pupil_count <- Catchments_LSOAtoSecSchool_2016$total_no_of_lsoa_pupils[match(lsoa_to_school_obvs$lsoa_code.y, Catchments_LSOAtoSecSchool_2016$lsoa_code)]
+
+lsoa_to_school_obvs$dest_school_pupil_count <- Catchments_SecSchootoLSOA_2016$total_sec_school_pupils[match(lsoa_to_school_obvs$dest,Catchments_SecSchootoLSOA_2016$secondary_school_urn)]
+
+```
+
+## Basic School Demand SIM
+
+```{r}
+#check variable distributions
+ggplot(lsoa_to_school_obvs) +
+  geom_histogram(aes(x = pupil_count))
+
+ggplot(lsoa_to_school_obvs) +
+  geom_histogram(aes(x = log(distances)))
+
+ggplot(lsoa_to_school_obvs) +
+  geom_histogram(aes(x = orig_lsoa_pupil_count))
+
+ggplot(lsoa_to_school_obvs) +
+  geom_histogram(aes(x = dest_school_pupil_count))
+
+```
+
+
+```{r}
+
+SchoolSIM1 <- glm(pupil_count ~ orig_lsoa_pupil_count + secondary_school_name + log(distances), na.action = na.exclude, family = poisson(link = "log"), data = lsoa_to_school_obvs)
+
+summary(SchoolSIM1)
+tidy(SchoolSIM1)
+```
+
+
+```{r}
+lsoa_to_school_obvs$fitted_schoolSIM1 <- fitted(SchoolSIM1) 
+lsoa_to_school_obvs$residSIM1 <- residuals(SchoolSIM1, type = "response")
+
+ggplot(lsoa_to_school_obvs) + 
+  geom_point(aes(x = log(pupil_count), y = log(fitted_schoolSIM1)))
+
+ggplot(lsoa_to_school_obvs) + 
+  geom_histogram(aes(x = residSIM1))
+
+range(lsoa_to_school_obvs$residSIM1)
+
+```
+
+
+```{r}
+CalcRSquared <- function(observed,estimated){
+  r <- cor(observed,estimated)
+  R2 <- r^2
+  R2
+}
+CalcRSquared(lsoa_to_school_obvs$pupil_count ,lsoa_to_school_obvs$fitted_schoolSIM1)
+```
+
+```{r}
+tmap_mode("view")
+
+plot2 <- tm_shape(lsoa_to_school_obvs) +
+  tm_lines(palette = "Spectral", 
+           breaks = c(-150, -50, -25, 0, 25, 50, 150),
+           midpoint = NA,
+           lwd = "residSIM1",
+           scale = 9,
+           id="lsoa_code.y",
+           popup.vars= c("lsoa_code.y", "secondary_school_name","residSIM1"),
+           title.lwd = "Residuals",
+           alpha = 0.6,
+           col = "residSIM1",
+           colorNA = NULL,
+           title = "Residuals")+
+  tm_shape(st_geometry(FinalSchools))+
+          tm_dots(col="black", size=0.01,id="establishment_name")
+
+plot2
+```
+
+### Adding More Variables
+
+```{r}
+
+lsoa_to_school_obvs <- st_join(lsoa_to_school_obvs, FinalSchools, by.x = dest, by.y = urn)
+
+names(lsoa_to_school_obvs)
+
+#SchoolSIM2 <- glm(pupil_count ~ lsoa_code.y + dest_school_pupil_count + log(distances), na.action = na.exclude, family = poisson(link = "log"), data = lsoa_to_school_obvs)
+
+#summary(SchoolSIM2)
+
+lsoa_to_school_obvs$fitted_schoolSIM2 <- fitted(SchoolSIM2) 
+
+CalcRSquared(lsoa_to_school_obvs$pupil_count, lsoa_to_school_obvs$fitted_schoolSIM2)
+
+```
+
